@@ -1,0 +1,118 @@
+name: "Build & Push Docker Image"
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Rebuild reason"
+        required: false
+        default: "Manual trigger"
+  repository_dispatch:
+    types: [upstream-release]
+
+# Concurrency: cancel any in-progress run when a new one starts.
+# Prevents binfmt cache race condition when two runs overlap.
+# Reference: https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: muaeabudhabi/wp-porttest2
+  UPSTREAM_URL: https://github.com/howardchung/watchparty
+
+jobs:
+  build-and-push:
+    name: "Build (amd64 + arm64) → DockerHub"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout wrapper repo (Dockerfile + templates)
+        uses: actions/checkout@v4
+        with:
+          path: wrapper
+
+      - name: Clone upstream source code (build context)
+        run: |
+          git clone --depth=1 ${{ env.UPSTREAM_URL }} source
+          # Dockerfile selection logic:
+          #
+          # If the upstream repo ships its own Dockerfile we use it — it is
+          # already tuned for that project's build process (custom build steps,
+          # native module compilation, multi-stage ordering, etc.).
+          # Overwriting it causes impossible-to-debug failures where upstream
+          # build scripts (e.g. pnpm ui:build) fail inside our generic template.
+          #
+          # If the upstream has NO Dockerfile we copy our TITAN-generated one
+          # which handles the common cases (Node/Python/Go/Rust/etc.).
+          #
+          # Either way, we save our generated file as Dockerfile.titan for
+          # reference — it contains the Unraid-optimised multi-stage template.
+          cp wrapper/Dockerfile source/Dockerfile.titan
+          # Always use TITAN-generated Dockerfile for Unraid compatibility.
+          # Upstream Alpine-based Dockerfiles often fail (missing build
+          # tools, musl/glibc issues). Our Dockerfile is Debian-based with
+          # multi-stage build, PUID/PGID support, and proper layer caching.
+          if [ -f source/Dockerfile ]; then
+            echo "✓ Upstream Dockerfile found — saving as Dockerfile.upstream"
+            mv source/Dockerfile source/Dockerfile.upstream
+          fi
+          echo "✓ Using TITAN-generated Dockerfile for Unraid compatibility"
+          cp wrapper/Dockerfile source/Dockerfile
+          echo "Build context files:"
+          ls source/ | head -20
+
+      - name: Set up QEMU (multi-arch support)
+        uses: docker/setup-qemu-action@v3
+        with:
+          cache-image: false
+          # cache-image: false — disables saving the binfmt Docker image
+          # to GitHub Actions cache. Without this, the post-step cache save
+          # fails with 'Unable to reserve cache key' and marks the entire
+          # job as failed even when the Docker build succeeded.
+          # Reference: https://github.com/docker/setup-qemu-action#inputs
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+
+      - name: Build and push (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source
+          file: ./source/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update DockerHub description from README
+        uses: peter-evans/dockerhub-description@v3
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          readme-filepath: ./wrapper/README.md
